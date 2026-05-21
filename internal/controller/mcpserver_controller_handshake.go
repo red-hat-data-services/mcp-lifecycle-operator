@@ -170,3 +170,34 @@ func isHTTPAuthError(err error) bool {
 	return strings.HasSuffix(msg, ": "+http.StatusText(http.StatusUnauthorized)) ||
 		strings.HasSuffix(msg, ": "+http.StatusText(http.StatusForbidden))
 }
+
+// reconcileHandshakeEventsAndRetryCount emits handshake-related events and returns the updated retry count.
+func (r *MCPServerReconciler) reconcileHandshakeEventsAndRetryCount(
+	mcpServer *mcpv1alpha1.MCPServer,
+	readyCondition metav1.Condition,
+) int32 {
+	if readyCondition.Reason != ReasonMCPEndpointUnavailable {
+		return 0
+	}
+
+	prevHandshakeRetryCount := mcpServer.Status.HandshakeRetryCount
+	if mcpServer.Status.ObservedGeneration != mcpServer.Generation {
+		prevHandshakeRetryCount = 0
+	}
+
+	var handshakeRetryCount int32
+	if mcpServer.Status.ObservedGeneration == mcpServer.Generation {
+		handshakeRetryCount = mcpServer.Status.HandshakeRetryCount + 1
+	} else {
+		handshakeRetryCount = 1
+	}
+
+	if !duplicateHandshakeUnavailable(mcpServer.Status.Conditions, readyCondition.Message) {
+		r.emitMCPHandshakeFailed(mcpServer, readyCondition.Message)
+	}
+	if int(handshakeRetryCount) >= maxMCPHandshakeRetries && int(prevHandshakeRetryCount) < maxMCPHandshakeRetries {
+		r.emitMCPHandshakeRetriesExhausted(mcpServer, handshakeRetryCount)
+	}
+
+	return handshakeRetryCount
+}
