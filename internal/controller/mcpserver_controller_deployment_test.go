@@ -68,8 +68,9 @@ var _ = Describe("MCPServer Controller - reconcileDeployment", func() {
 		Expect(k8sClient.Get(ctx, typeNamespacedName, mcpServer)).To(Succeed())
 
 		reconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		deployment, err := reconciler.reconcileDeployment(ctx, mcpServer)
@@ -83,8 +84,9 @@ var _ = Describe("MCPServer Controller - reconcileDeployment", func() {
 		Expect(k8sClient.Get(ctx, typeNamespacedName, mcpServer)).To(Succeed())
 
 		reconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := reconciler.reconcileDeployment(ctx, mcpServer)
@@ -93,6 +95,44 @@ var _ = Describe("MCPServer Controller - reconcileDeployment", func() {
 		deployment, err := reconciler.reconcileDeployment(ctx, mcpServer)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(deployment).NotTo(BeNil())
+	})
+
+	// Defensive guard: createDeployment always produces a container today, so
+	// this scenario cannot be triggered through reconcileDeployment. We test
+	// deploymentNeedsUpdate directly to ensure the len(newPodSpec.Containers)==0
+	// guard prevents an index-out-of-bounds panic if a future refactor (e.g. a
+	// new source type) produces a desired deployment with no containers.
+	It("should return false from deploymentNeedsUpdate when desired deployment has empty containers list", func() {
+		By("Setting up a valid existing deployment and an empty desired deployment")
+		mcpServer := newTestMCPServer("test-empty-desired")
+
+		existingDeployment := &appsv1.Deployment{
+			Spec: appsv1.DeploymentSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name:  ManagedWorkloadName,
+								Image: "docker.io/library/test-image:latest",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		desiredDeployment := &appsv1.Deployment{
+			Spec: appsv1.DeploymentSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: nil,
+					},
+				},
+			},
+		}
+
+		By("Calling deploymentNeedsUpdate should not panic and should return false")
+		Expect(deploymentNeedsUpdate(mcpServer, existingDeployment, desiredDeployment, false)).To(BeFalse())
 	})
 
 	It("should recover when existing deployment has empty containers list", func() {
@@ -135,8 +175,9 @@ var _ = Describe("MCPServer Controller - reconcileDeployment", func() {
 			Build()
 
 		reconciler := &MCPServerReconciler{
-			Client: fakeClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    fakeClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		By("Reconciling should not panic and should restore the containers")
@@ -186,8 +227,9 @@ var _ = Describe("MCPServer Controller - Deployment Reconciliation Failures", fu
 		})
 
 		deploymentFailureReconciler := &MCPServerReconciler{
-			Client: interceptedClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    interceptedClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		By("Reconciling with deployment creation failure")
@@ -217,8 +259,9 @@ var _ = Describe("MCPServer Controller - Deployment Reconciliation Failures", fu
 	It("should update status with DeploymentUnavailable when deployment update fails", func() {
 		By("Initial reconcile to create resources")
 		initialReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 		_, err := initialReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: typeNamespacedName,
@@ -246,8 +289,9 @@ var _ = Describe("MCPServer Controller - Deployment Reconciliation Failures", fu
 		})
 
 		deploymentFailureReconciler := &MCPServerReconciler{
-			Client: interceptedClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    interceptedClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		By("Updating MCPServer spec to trigger deployment reconciliation")
@@ -338,8 +382,9 @@ var _ = Describe("MCPServer Controller - Transient Validation Errors", func() {
 		})
 
 		transientReconciler := &MCPServerReconciler{
-			Client: interceptedClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    interceptedClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		By("Reconciling with transient ConfigMap validation failure")
@@ -374,8 +419,9 @@ var _ = Describe("MCPServer Controller - Transient Validation Errors", func() {
 		Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
 
 		initialReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 		_, err := initialReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: typeNamespacedName,
@@ -410,8 +456,9 @@ var _ = Describe("MCPServer Controller - Transient Validation Errors", func() {
 		})
 
 		transientReconciler := &MCPServerReconciler{
-			Client: interceptedClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    interceptedClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		By("Reconciling with transient failure")
@@ -468,8 +515,9 @@ var _ = Describe("MCPServer Controller - Resource Requirements", func() {
 
 	It("should create deployment with resources", func() {
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -494,8 +542,9 @@ var _ = Describe("MCPServer Controller - Resource Requirements", func() {
 
 	It("should update deployment when resources change", func() {
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		By("Reconciling to create the initial deployment with resources")
@@ -546,8 +595,9 @@ var _ = Describe("MCPServer Controller - Resource Requirements", func() {
 
 	It("should update deployment when resources are removed", func() {
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		By("Reconciling to create the initial deployment with resources")
@@ -602,8 +652,9 @@ var _ = Describe("MCPServer Controller - Resource Requirements", func() {
 		}()
 
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -639,8 +690,9 @@ var _ = Describe("MCPServer Controller - Resource Requirements", func() {
 		}()
 
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -678,8 +730,9 @@ var _ = Describe("MCPServer Controller - Resource Requirements", func() {
 		}()
 
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -718,8 +771,9 @@ var _ = Describe("MCPServer Controller - Resource Requirements", func() {
 		}()
 
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -786,8 +840,9 @@ var _ = Describe("MCPServer Controller - Health Probes", func() {
 
 	It("should create deployment with health probes", func() {
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -821,8 +876,9 @@ var _ = Describe("MCPServer Controller - Health Probes", func() {
 
 	It("should update deployment when probes change", func() {
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		By("Reconciling to create the initial deployment with probes")
@@ -890,8 +946,9 @@ var _ = Describe("MCPServer Controller - Health Probes", func() {
 
 	It("should update deployment when probes are removed", func() {
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		By("Reconciling to create the initial deployment with probes")
@@ -953,8 +1010,9 @@ var _ = Describe("MCPServer Controller - Health Probes", func() {
 		}()
 
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -995,8 +1053,9 @@ var _ = Describe("MCPServer Controller - Health Probes", func() {
 		}()
 
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -1026,8 +1085,9 @@ var _ = Describe("MCPServer Controller - Health Probes", func() {
 		}()
 
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -1062,8 +1122,9 @@ var _ = Describe("MCPServer Controller - Health Probes", func() {
 		}()
 
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -1089,8 +1150,40 @@ var _ = Describe("MCPServer Controller - Health Probes", func() {
 		Expect(probe).NotTo(BeNil())
 		Expect(probe.TCPSocket).NotTo(BeNil())
 		Expect(probe.TCPSocket.Port.IntVal).To(Equal(int32(8080)))
-		Expect(probe.InitialDelaySeconds).To(BeZero(), "should use Kubernetes default")
-		Expect(probe.PeriodSeconds).To(BeZero(), "should use Kubernetes default")
+		Expect(probe.InitialDelaySeconds).To(BeZero())
+		Expect(probe.PeriodSeconds).NotTo(BeZero())
+		Expect(probe.TimeoutSeconds).NotTo(BeZero())
+		Expect(probe.SuccessThreshold).NotTo(BeZero())
+		Expect(probe.FailureThreshold).NotTo(BeZero())
+	})
+
+	It("should fill zero-valued timing fields on user-provided probes", func() {
+		probe := withProbeDefaults(&corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(8080)},
+			},
+		})
+		Expect(probe.FailureThreshold).NotTo(BeZero())
+		Expect(probe.PeriodSeconds).NotTo(BeZero())
+		Expect(probe.SuccessThreshold).NotTo(BeZero())
+		Expect(probe.TimeoutSeconds).NotTo(BeZero())
+		Expect(probe.HTTPGet.Path).To(Equal("/healthz"))
+	})
+
+	It("should preserve user-set timing fields on probes", func() {
+		probe := withProbeDefaults(&corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(8080)},
+			},
+			PeriodSeconds:       30,
+			FailureThreshold:    5,
+			InitialDelaySeconds: 10,
+		})
+		Expect(probe.PeriodSeconds).To(Equal(int32(30)))
+		Expect(probe.FailureThreshold).To(Equal(int32(5)))
+		Expect(probe.InitialDelaySeconds).To(Equal(int32(10)))
+		Expect(probe.SuccessThreshold).NotTo(BeZero())
+		Expect(probe.TimeoutSeconds).NotTo(BeZero())
 	})
 
 	It("should use provided port in default readiness probe", func() {
@@ -1120,8 +1213,9 @@ var _ = Describe("MCPServer Controller - Health Probes", func() {
 		}()
 
 		controllerReconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -1162,8 +1256,9 @@ var _ = Describe("MCPServer Controller - Health Probes", func() {
 		}()
 
 		reconciler := &MCPServerReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			APIReader: k8sClient,
 		}
 
 		deployment, err := reconciler.reconcileDeployment(ctx, mcpServer)
@@ -1194,6 +1289,27 @@ var _ = Describe("MCPServer Controller - Health Probes", func() {
 		By("Verifying tracking annotations are set")
 		Expect(createdDeployment.Annotations).To(HaveKey(managedExtraLabels))
 		Expect(createdDeployment.Annotations).To(HaveKey(managedExtraAnnotations))
+	})
+
+	It("should default PodSecurityContext to empty when not specified", func() {
+		mcpServer := newTestMCPServer("test-pod-sc-default")
+		reconciler := newReconcilerForTest(k8sClient, k8sClient.Scheme())
+		deployment, err := reconciler.createDeployment(mcpServer)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(deployment.Spec.Template.Spec.SecurityContext).NotTo(BeNil())
+		Expect(*deployment.Spec.Template.Spec.SecurityContext).To(Equal(corev1.PodSecurityContext{}))
+	})
+
+	It("should use provided PodSecurityContext when specified", func() {
+		mcpServer := newTestMCPServer("test-pod-sc-custom")
+		mcpServer.Spec.Runtime.Security.PodSecurityContext = &corev1.PodSecurityContext{
+			RunAsNonRoot: new(true),
+		}
+		reconciler := newReconcilerForTest(k8sClient, k8sClient.Scheme())
+		deployment, err := reconciler.createDeployment(mcpServer)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(deployment.Spec.Template.Spec.SecurityContext).NotTo(BeNil())
+		Expect(*deployment.Spec.Template.Spec.SecurityContext.RunAsNonRoot).To(BeTrue())
 	})
 })
 
