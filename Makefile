@@ -84,7 +84,7 @@ COVER_OUTPUT_DIR ?= out
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" \
-		go test $$(go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v /e2e) -coverprofile $(COVER_PROFILE)
+		go test $$(go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./...) -coverprofile $(COVER_PROFILE)
 
 .PHONY: test-cover
 test-cover: test ## Run unit tests and write text + HTML coverage reports under out/ (informational).
@@ -252,13 +252,21 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
-	"$(KUSTOMIZE)" build $(KUSTOMIZE_DEFAULT_DIR) | "$(KUBECTL)" apply -f -
+	$(call kustomize-set-image,$(KUSTOMIZE_DEFAULT_DIR),${IMG})
 
 .PHONY: deploy-debug
 deploy-debug: manifests kustomize ## Deploy controller with Delve for remote debugging.
-	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
-	"$(KUSTOMIZE)" build config/manager-debug | "$(KUBECTL)" apply -f -
+	$(call kustomize-set-image,config/manager-debug,${IMG})
+
+define kustomize-set-image
+set -euo pipefail; \
+dir=$$(mktemp -d); \
+trap 'rm -rf "$$dir"' EXIT; \
+ln -s $(CURDIR)/$(1) $$dir/base && \
+printf 'resources:\n- base\n' > $$dir/kustomization.yaml && \
+cd $$dir && "$(KUSTOMIZE)" edit set image $(IMAGE_TAG_BASE)=$(2) && \
+"$(KUSTOMIZE)" build $$dir | "$(KUBECTL)" apply -f -
+endef
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
