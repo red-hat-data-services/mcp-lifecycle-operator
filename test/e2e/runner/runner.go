@@ -53,6 +53,7 @@ func (r *Runner) Run(args []string) Result {
 	testCount := envOr("E2E_COUNT", "1")
 	junitSuiteName := envOr("E2E_JUNIT_SUITE_NAME", "relative")
 	junitClassName := envOr("E2E_JUNIT_CLASS_NAME", "relative")
+	junitProjectName := envOr("E2E_JUNIT_PROJECT_NAME", "mcp-lifecycle-operator")
 
 	junitFile := filepath.Join(resultsDir, "junit.xml")
 	jsonFile := filepath.Join(resultsDir, "log.jsonl")
@@ -70,6 +71,7 @@ func (r *Runner) Run(args []string) Result {
 	cmdArgs = append(cmdArgs,
 		"--raw-command",
 		"--junitfile", junitFile,
+		"--junitfile-project-name", junitProjectName,
 		"--junitfile-testsuite-name", junitSuiteName,
 		"--junitfile-testcase-classname", junitClassName,
 		"--jsonfile", jsonFile,
