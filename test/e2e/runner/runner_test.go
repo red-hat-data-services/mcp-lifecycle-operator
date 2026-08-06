@@ -39,6 +39,7 @@ func TestRunBuildsCorrectCommand(t *testing.T) {
 	t.Setenv("GO_TEST_VERBOSITY", "standard-verbose")
 	t.Setenv("E2E_JUNIT_SUITE_NAME", "mysuite")
 	t.Setenv("E2E_JUNIT_CLASS_NAME", "myclass")
+	t.Setenv("E2E_JUNIT_PROJECT_NAME", "myproject")
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	result := runner.New().WithStdout(&stdoutBuf).WithStderr(&stderrBuf).Run([]string{"-test.timeout=5m", "-test.run=TestFoo"})
@@ -57,6 +58,7 @@ func TestRunBuildsCorrectCommand(t *testing.T) {
 	expects := []string{
 		"--raw-command",
 		"--junitfile " + filepath.Join(resultsDir, "junit.xml"),
+		"--junitfile-project-name myproject",
 		"--junitfile-testsuite-name mysuite",
 		"--junitfile-testcase-classname myclass",
 		"--jsonfile " + filepath.Join(resultsDir, "log.jsonl"),
