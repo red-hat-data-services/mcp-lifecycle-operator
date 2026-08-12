@@ -27,8 +27,12 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -o /test2json $(go env GOROOT)/src/cmd/test2json
 
+# NB: testPackages maps Go package names to pre-compiled test binaries for
+# JUnit XML reporting. Format: "pkg=binary,pkg2=binary2". Add new entries
+# when splitting e2e tests into subpackages.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -o /e2e-run ./test/e2e/cmd/run/
+    go build -ldflags="-X 'github.com/kubernetes-sigs/mcp-lifecycle-operator/test/e2e/runner.TestPackages=e2e=/e2e/e2e-tests'" \
+    -o /e2e-run ./test/e2e/cmd/run/
 
 FROM --platform=$TARGETPLATFORM ${BASE_IMAGE}
 ARG USER_ID=65532
