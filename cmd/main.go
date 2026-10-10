@@ -29,6 +29,7 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -45,6 +46,7 @@ import (
 	mcpv1beta1 "github.com/kubernetes-sigs/mcp-lifecycle-operator/api/v1beta1"
 	"github.com/kubernetes-sigs/mcp-lifecycle-operator/internal/controller"
 	"github.com/kubernetes-sigs/mcp-lifecycle-operator/internal/controller/providers"
+	kuadrantapi "github.com/kubernetes-sigs/mcp-lifecycle-operator/internal/controller/providers/kuadrant/api"
 	webhookpolicy "github.com/kubernetes-sigs/mcp-lifecycle-operator/internal/webhook"
 
 	// Gateway integration providers register themselves via init().
@@ -65,6 +67,8 @@ func init() {
 	utilruntime.Must(mcpv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(mcpv1beta1.AddToScheme(scheme))
 	utilruntime.Must(gatewayv1.Install(scheme))
+	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
+	utilruntime.Must(kuadrantapi.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -85,6 +89,7 @@ func main() {
 	var requireImageDigest bool
 	var maxStorageMounts int
 	var requiredLabels string
+	var disallowPrivilegedSecurityContext bool
 	var networkPolicyDefaultPosture string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -125,6 +130,10 @@ func main() {
 	flag.StringVar(&requiredLabels, "required-labels", "",
 		"Comma-separated list of labels that must be present on MCPServer resources. "+
 			"Falls back to REQUIRED_LABELS env var if not set. Empty means no requirement.")
+	flag.BoolVar(&disallowPrivilegedSecurityContext, "disallow-privileged-security-context", false,
+		"If set, the validation webhook rejects MCPServer pod/container security contexts that request "+
+			"privileged, allowPrivilegeEscalation, runAsNonRoot=false, runAsUser=0, or privileged capabilities. "+
+			"Falls back to DISALLOW_PRIVILEGED_SECURITY_CONTEXT env var if not set.")
 	flag.StringVar(&networkPolicyDefaultPosture, "network-policy-default-posture", "open",
 		"Default NetworkPolicy posture applied to a managed workload when a network dimension is left "+
 			"unconfigured. \"open\" keeps the historical default; \"restricted\" denies unconfigured ingress by "+
@@ -289,7 +298,7 @@ func main() {
 		os.Exit(1)
 	}
 	if enableWebhook {
-		admissionPolicy := parseAdmissionFlags(imageAllowlist, requireImageDigest, maxStorageMounts, requiredLabels)
+		admissionPolicy := parseAdmissionFlags(imageAllowlist, requireImageDigest, maxStorageMounts, requiredLabels, disallowPrivilegedSecurityContext)
 		if err := mcpv1alpha1.SetupWebhookWithManager(mgr, admissionPolicy); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "MCPServer")
 			os.Exit(1)
@@ -327,19 +336,21 @@ func main() {
 	}
 }
 
-func parseAdmissionFlags(imageAllowlist string, requireImageDigest bool, maxStorageMounts int, requiredLabels string) *webhookpolicy.AdmissionPolicy {
+func parseAdmissionFlags(imageAllowlist string, requireImageDigest bool, maxStorageMounts int, requiredLabels string, disallowPrivilegedSecurityContext bool) *webhookpolicy.AdmissionPolicy {
 	policy := webhookpolicy.ParseAdmissionPolicy(setupLog, webhookpolicy.PolicyFlags{
-		ImageAllowlist:     imageAllowlist,
-		RequireImageDigest: requireImageDigest,
-		MaxStorageMounts:   maxStorageMounts,
-		RequiredLabels:     requiredLabels,
+		ImageAllowlist:                    imageAllowlist,
+		RequireImageDigest:                requireImageDigest,
+		MaxStorageMounts:                  maxStorageMounts,
+		RequiredLabels:                    requiredLabels,
+		DisallowPrivilegedSecurityContext: disallowPrivilegedSecurityContext,
 	})
 	if policy.HasActiveRules() {
 		setupLog.Info("Admission webhook policy configured",
 			"imageAllowlist", policy.ImageAllowlist,
 			"requireImageDigest", policy.RequireImageDigest,
 			"maxStorageMounts", policy.MaxStorageMounts,
-			"requiredLabels", policy.RequiredLabels)
+			"requiredLabels", policy.RequiredLabels,
+			"disallowPrivilegedSecurityContext", policy.DisallowPrivilegedSecurityContext)
 	}
 	return policy
 }
