@@ -250,7 +250,7 @@ deploy-test-e2e-gateway: deploy-test-e2e deploy-cloud-provider-kind ## Deploy op
 
 .PHONY: test-e2e-gateway
 test-e2e-gateway: ## Run gateway e2e tests for a specific provider (set GATEWAY_PROVIDER=httproute|kuadrant).
-	GATEWAY_PROVIDER=$(GATEWAY_PROVIDER) go test -tags=e2e ./test/e2e/gateway/... -v -count=1 -timeout 1h -profile gateway-$(GATEWAY_PROVIDER)
+	go test -tags=e2e ./test/e2e/gateway/$(GATEWAY_PROVIDER)/... -v -count=1 -timeout 1h -profile gateway-$(GATEWAY_PROVIDER)
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: stop-cloud-provider-kind ## Tear down the Kind cluster used for e2e tests
@@ -427,7 +427,7 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   [ -n "$$v" ] || { echo "Set ENVTEST_K8S_VERSION manually (k8s.io/api replace has no tag)" >&2; exit 1; }; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
-GOLANGCI_LINT_VERSION ?= v2.13.0
+GOLANGCI_LINT_VERSION ?= v2.14.0
 
 # GO_TOOLCHAIN is the toolchain declared in go.mod. Tools installed via
 # go-install-tool are built with it so their bundled go/types can parse the

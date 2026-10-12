@@ -65,6 +65,9 @@ spec:
 !!! warning "Restricted default posture needs an explicit `ingressFrom`"
     The operator can be started with `--network-policy-default-posture=restricted`. Under that posture an MCPServer that omits `spec.network.ingressFrom` gets a **deny-all** ingress policy instead of the open default. This deny only takes effect where a NetworkPolicy-enforcing network plugin (CNI) is installed - without one the policy has no effect and untrusted pods can still reach the server. It is also **additive** with other NetworkPolicies: Kubernetes unions the ingress rules of every policy that selects the pod, so a deny-all here does not override an allow rule from another applicable policy. Where the policy is enforced, the operator completes the MCP handshake by connecting to the server pod, so a deny-all ingress also blocks the operator itself (and any gateway): the server never reaches `Verified` and no `status.address` is published. Under restricted posture always set `ingressFrom` with peers that match the operator pods and every gateway source that must reach the server - the operator never adds an implicit peer for itself. This flag only changes the default for *unconfigured* dimensions; an explicit `spec.network` value is always honored regardless of posture.
 
+!!! note "Observing the effective posture"
+    The open default is not silent. When the operator starts with the default `--network-policy-default-posture=open`, it logs a `WARNING:` advisory noting that servers without `ingressFrom` are reachable from any namespace and pointing at the restricted alternative. Independently of the flag, every MCPServer reports its applied posture in the `NetworkPolicyRestricted` status condition: `status: "True"` (reason `Restricted`) once both ingress sources and egress are constrained, and `status: "False"` (reason `Unrestricted`, `IngressUnrestricted`, or `EgressUnrestricted`) while either direction is still open. Watch that condition (`kubectl get mcpserver -o jsonpath='{.status.conditions}'`) to find servers still running with open ingress. The condition is informational and never gates readiness.
+
 Peers use the standard Kubernetes `NetworkPolicyPeer` shape (`podSelector`, `namespaceSelector`, `ipBlock`); `ipBlock` cannot be combined with the selector fields. These constraints are checked during **reconciliation**, not by an admission webhook: an MCPServer with an invalid CIDR is still admitted by the API server and then reports a `ValidationError` status condition, so validate config before applying rather than relying on `kubectl apply` to reject it.
 
 ## Gateway integration
@@ -114,9 +117,17 @@ securityContext:
 
 Additional hardening for production:
 
-- **RBAC** - the operator installs with the ClusterRole it needs to manage MCP servers cluster-wide. If you run it scoped to specific namespaces, tighten the role bindings accordingly and review the granted verbs against your least-privilege baseline.
+- **RBAC** - the operator installs with the ClusterRole it needs to manage MCP servers cluster-wide. If you run it scoped to specific namespaces, tighten the role bindings accordingly and review the granted verbs against your least-privilege baseline. The ClusterRole also grants cluster-wide `get;list;watch` on `secrets` and `configmaps` - see [Cluster-wide Secret and ConfigMap access](#cluster-wide-secret-and-configmap-access).
 - **Namespace isolation** - apply a NetworkPolicy to the operator's own namespace so only your monitoring stack can reach the metrics port.
 - **Image provenance** - pin the operator image by digest and verify signatures where your supply-chain policy requires it.
+
+### Cluster-wide Secret and ConfigMap access
+
+The operator's ClusterRole grants cluster-wide `get;list;watch` on `secrets` and `configmaps`. This cannot be narrowed: MCPServers may live in any namespace, so the role cannot be namespace-scoped, and the operator watches Secret and ConfigMap metadata for drift, which requires `list;watch` (Kubernetes RBAC cannot scope `list`/`watch` by label or field). Treat the operator namespace as privileged.
+
+- **Blast radius** - a compromised operator token can `get`/`list` Secrets and ConfigMaps cluster-wide.
+- **Caching** - Secret and ConfigMap *contents* are never held in the operator cache: both are read uncached via the API reader, and only their metadata is watched to trigger reconciles on drift. Pods are the only object type given a dedicated content cache, and it is label-scoped to managed Pods and stripped to the fields diagnostics need (see `internal/controller/cache.go`).
+- **Compensating controls** - restrict and network-isolate the operator namespace, keep the shipped restricted `securityContext` (above), and audit access to the operator ServiceAccount.
 
 ## Availability & operations
 

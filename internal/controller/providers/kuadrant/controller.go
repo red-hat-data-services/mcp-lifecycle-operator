@@ -21,6 +21,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -60,11 +63,98 @@ func init() {
 	})
 }
 
+// allowedExtensionNamespaces is the operator-level allowlist of namespaces the
+// provider is permitted to read MCPGatewayExtension routing config from. It is
+// configured once at startup via SetAllowedExtensionNamespaces and consumed by
+// Setup when the reconciler is constructed. Empty means unrestricted (the
+// historical default behavior).
+var allowedExtensionNamespaces []string
+
+// SetAllowedExtensionNamespaces configures the trusted extension-namespace
+// allowlist applied to kuadrant reconcilers created by Setup. It must be called
+// before providers.SetupAll. An empty or nil slice disables the control.
+func SetAllowedExtensionNamespaces(namespaces []string) {
+	allowedExtensionNamespaces = namespaces
+}
+
+const envAllowedExtensionNamespaces = "KUADRANT_ALLOWED_EXTENSION_NAMESPACES"
+
+// ParseAllowedExtensionNamespaces reads the trusted extension-namespace
+// allowlist. When flagSet is true the flag was provided on the command line and
+// its value wins (even an explicit empty value, which disables the control);
+// only when flagSet is false does it fall back to the
+// KUADRANT_ALLOWED_EXTENSION_NAMESPACES env var. The value is a comma-separated
+// list of namespace names; blank entries are ignored. A nil result means the
+// control is disabled (unrestricted).
+func ParseAllowedExtensionNamespaces(flagValue string, flagSet bool) []string {
+	raw := flagValue
+	if !flagSet {
+		raw = os.Getenv(envAllowedExtensionNamespaces)
+	}
+	var out []string
+	for ns := range strings.SplitSeq(raw, ",") {
+		if trimmed := strings.TrimSpace(ns); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// ValidExtensionNamespace reports whether ns is a syntactically valid extension
+// namespace name (an RFC 1123 label). This is the single source of truth for
+// the namespace-name rule, applied both to allowlist entries at startup and to
+// the tenant-supplied extension-namespace at reconcile time.
+func ValidExtensionNamespace(ns string) bool {
+	return len(validation.IsDNS1123Label(ns)) == 0
+}
+
+// ValidExtensionName reports whether name is a syntactically valid extension
+// resource name (an RFC 1123 subdomain).
+func ValidExtensionName(name string) bool {
+	return len(validation.IsDNS1123Subdomain(name)) == 0
+}
+
+// PartitionExtensionNamespaces splits allowlist entries into valid and invalid
+// namespace names using ValidExtensionNamespace. It is pure so the startup
+// fail-closed decision (non-empty allowlist that yields no valid entries) can
+// be unit-tested without a process exit.
+func PartitionExtensionNamespaces(entries []string) (valid, invalid []string) {
+	for _, ns := range entries {
+		if ValidExtensionNamespace(ns) {
+			valid = append(valid, ns)
+		} else {
+			invalid = append(invalid, ns)
+		}
+	}
+	return valid, invalid
+}
+
+// ResolveAllowedExtensionNamespaces parses the allowlist (flag with env fallback,
+// see ParseAllowedExtensionNamespaces) and validates each entry as an RFC 1123
+// namespace label. It returns the valid entries and the dropped invalid entries
+// (for logging). It fails closed: if the configuration is non-empty but yields no
+// valid entries, it returns an error instead of silently collapsing to the
+// unrestricted default, so a typo (or an uppercase value that can never match a
+// lowercase namespace) is a fatal startup error rather than a silent fail-open. An
+// empty/unset configuration returns nil with no error (control disabled).
+func ResolveAllowedExtensionNamespaces(flagValue string, flagSet bool) (allowed, invalid []string, err error) {
+	parsed := ParseAllowedExtensionNamespaces(flagValue, flagSet)
+	allowed, invalid = PartitionExtensionNamespaces(parsed)
+	if len(parsed) > 0 && len(allowed) == 0 {
+		return nil, invalid, fmt.Errorf(
+			"kuadrant extension-namespace allowlist was configured (%v) but contains no valid RFC 1123 namespace names",
+			parsed)
+	}
+	return allowed, invalid, nil
+}
+
 // Setup creates the kuadrant provider controller and registers it with the manager.
 func Setup(mgr ctrl.Manager) error {
 	return (&Reconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:                     mgr.GetClient(),
+		APIReader:                  mgr.GetAPIReader(),
+		Scheme:                     mgr.GetScheme(),
+		AllowedExtensionNamespaces: allowedExtensionNamespaces,
 	}).SetupWithManager(mgr)
 }
 
@@ -87,7 +177,18 @@ const (
 // resources that register MCP servers with the Kuadrant MCP Gateway.
 type Reconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader is an uncached reader used for ConfigMap content reads, so the
+	// controller does not start a full ConfigMap informer that would cache every
+	// ConfigMap's data. ConfigMaps are watched metadata-only.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+
+	// AllowedExtensionNamespaces is an opt-in allowlist of namespaces from which
+	// the provider may read an MCPGatewayExtension. The extension namespace is
+	// supplied by a tenant-controlled ConfigMap, so when this list is non-empty
+	// any namespace outside it is rejected to prevent routing config from being
+	// read out of an attacker-planted namespace. Empty means no restriction.
+	AllowedExtensionNamespaces []string
 }
 
 // +kubebuilder:rbac:groups=mcp.x-k8s.io,resources=mcpgatewaybindings,verbs=get;list;watch
@@ -119,7 +220,7 @@ func (r *Reconciler) parseConfig(ctx context.Context, binding *mcpv1alpha1.MCPGa
 		return nil, r.setNotRegistered(ctx, binding,
 			"spec.configRef is required for kuadrant provider")
 	}
-	if err := r.Get(ctx, client.ObjectKey{Name: binding.Spec.ConfigRef, Namespace: binding.Namespace}, configMap); err != nil {
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Name: binding.Spec.ConfigRef, Namespace: binding.Namespace}, configMap); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return nil, err
 		}
@@ -136,6 +237,28 @@ func (r *Reconciler) parseConfig(ctx context.Context, binding *mcpv1alpha1.MCPGa
 	if !ok || extNamespace == "" {
 		return nil, r.setNotRegistered(ctx, binding,
 			fmt.Sprintf("ConfigMap %q missing required key %q", binding.Spec.ConfigRef, configKeyExtensionNamespace))
+	}
+
+	// Always-on, cheap format validation: both values are read from a
+	// tenant-controlled ConfigMap and used to build an object key, so reject
+	// syntactically invalid names before touching the API server. Resource names
+	// are RFC 1123 subdomains; namespace names are RFC 1123 labels.
+	if !ValidExtensionName(extName) {
+		return nil, r.setNotRegistered(ctx, binding,
+			fmt.Sprintf("%q value %q is not a valid RFC 1123 name", configKeyExtensionName, extName))
+	}
+	if !ValidExtensionNamespace(extNamespace) {
+		return nil, r.setNotRegistered(ctx, binding,
+			fmt.Sprintf("%q value %q is not a valid RFC 1123 namespace name", configKeyExtensionNamespace, extNamespace))
+	}
+
+	// Opt-in trust gate: when an allowlist is configured, refuse to read routing
+	// config from any namespace outside it. A tenant that controls the ConfigMap
+	// could otherwise point extension-namespace at a namespace they planted an
+	// MCPGatewayExtension in, hijacking the server's routing.
+	if len(r.AllowedExtensionNamespaces) > 0 && !slices.Contains(r.AllowedExtensionNamespaces, extNamespace) {
+		return nil, r.setNotRegistered(ctx, binding,
+			fmt.Sprintf("%q %q is not in the operator's trusted extension-namespace allowlist", configKeyExtensionNamespace, extNamespace))
 	}
 
 	prefix := configMap.Data[configKeyPrefix]
@@ -217,25 +340,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		gwNamespace = ext.Namespace
 	}
 
-	sectionName := ref.SectionName
-	if cfg.sectionName != "" {
-		sectionName = cfg.sectionName
-	}
+	sectionName := cfg.sectionName
 	if sectionName == "" {
-		return ctrl.Result{}, r.setNotRegistered(ctx, binding,
-			fmt.Sprintf("MCPGatewayExtension %q has no targetRef.sectionName; set %q in the ConfigMap", cfg.extensionName, configKeySectionName))
+		discovered, discoverErr := r.discoverWildcardListener(ctx, gwName, gwNamespace)
+		if discoverErr != nil {
+			return ctrl.Result{}, r.setNotRegistered(ctx, binding, discoverErr.Error())
+		}
+		sectionName = discovered
 	}
 
-	routeHostname := cfg.routeHostname
-	if routeHostname == "" {
-		var resolveErr error
-		routeHostname, resolveErr = r.resolveHostname(ctx, mcpServer.Name, mcpServer.Namespace, gwName, gwNamespace, sectionName)
-		if resolveErr != nil {
-			return ctrl.Result{}, r.setNotRegistered(ctx, binding, resolveErr.Error())
-		}
-	} else if err := providers.ValidateHostname(routeHostname); err != nil {
-		return ctrl.Result{}, r.setNotRegistered(ctx, binding,
-			fmt.Sprintf("invalid %q in ConfigMap %q: %v", configKeyRouteHostname, binding.Spec.ConfigRef, err))
+	routeHostname, hostnameWarning, resolveErr := r.resolveRouteHostname(ctx, binding, mcpServer, cfg, gwName, gwNamespace, sectionName)
+	if resolveErr != nil {
+		return ctrl.Result{}, r.setNotRegistered(ctx, binding, resolveErr.Error())
 	}
 
 	if err := r.reconcileHTTPRoute(ctx, binding, mcpServer, gwName, gwNamespace, routeHostname, sectionName, cfg.path); err != nil {
@@ -292,8 +408,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	statusURL := fmt.Sprintf("%s://%s%s", ep.scheme, providers.FormatHost(ep.host), cfg.path)
 
+	statusMsg := "HTTPRoute accepted and MCPServerRegistration ready"
+	if hostnameWarning != "" {
+		statusMsg = statusMsg + "; " + hostnameWarning
+	}
+
 	return ctrl.Result{}, providers.UpdateBindingStatus(ctx, r.Status(), binding, metav1.ConditionTrue,
-		mcpcontroller.ReasonGatewayRegistered, "HTTPRoute accepted and MCPServerRegistration ready", statusURL)
+		mcpcontroller.ReasonGatewayRegistered, statusMsg, statusURL)
 }
 
 func isExtensionReady(ext *kuadrantapi.MCPGatewayExtension) bool {
@@ -509,12 +630,120 @@ func (r *Reconciler) deleteStaleResources(ctx context.Context, binding *mcpv1alp
 	return nil
 }
 
+// resolveRouteHostname determines the backend hostname for the HTTPRoute. When
+// route-hostname is not set it is derived from the selected Gateway listener via
+// resolveHostname. When route-hostname is set explicitly it is validated and the
+// same listener safety guard is applied, so the explicit path cannot be used to
+// bypass the HTTPS/TLS direct-hostname check. It returns the hostname, an
+// optional status warning, and an error describing why the binding cannot be
+// registered.
+func (r *Reconciler) resolveRouteHostname(
+	ctx context.Context,
+	binding *mcpv1alpha1.MCPGatewayBinding,
+	mcpServer *mcpv1beta1.MCPServer,
+	cfg *parsedConfig,
+	gwName, gwNamespace, sectionName string,
+) (string, string, error) {
+	if cfg.routeHostname == "" {
+		return r.resolveHostname(ctx, mcpServer.Name, mcpServer.Namespace, gwName, gwNamespace, sectionName)
+	}
+	if err := providers.ValidateHostname(cfg.routeHostname); err != nil {
+		return "", "", fmt.Errorf("invalid %q in ConfigMap %q: %v", configKeyRouteHostname, binding.Spec.ConfigRef, err)
+	}
+	// An explicit route-hostname bypasses resolveHostname, so apply the same
+	// listener safety guard here: an HTTPS/TLS listener with a direct
+	// (non-wildcard) hostname cannot host per-server routing even when the user
+	// supplies their own hostname.
+	if err := r.checkListenerHostnameGuard(ctx, gwName, gwNamespace, sectionName); err != nil {
+		return "", "", err
+	}
+	return cfg.routeHostname, "", nil
+}
+
 // resolveHostname constructs the backend hostname from the Gateway listener's
-// wildcard hostname. The namespace is included to avoid collisions when
-// multiple namespaces contain MCPServers with the same name. For example,
-// if the listener hostname is "*.mcp.local", the MCPServer name is "my-server"
-// and its namespace is "team-a", the result is "my-server.team-a.mcp.local".
-func (r *Reconciler) resolveHostname(ctx context.Context, mcpServerName, mcpServerNamespace, gwName, gwNamespace, sectionName string) (string, error) {
+// hostname. For wildcard hostnames (e.g. "*.mcp.local") it constructs a
+// per-server hostname like "my-server.team-a.mcp.local". For direct (non-wildcard)
+// HTTP hostnames it returns the hostname as-is with a warning that only one
+// MCPServer can route through that listener. HTTPS/TLS listeners require a
+// wildcard hostname for per-server routing and return an error for direct hostnames.
+func (r *Reconciler) resolveHostname(ctx context.Context, mcpServerName, mcpServerNamespace, gwName, gwNamespace, sectionName string) (string, string, error) {
+	listener, err := r.findGatewayListener(ctx, gwName, gwNamespace, sectionName)
+	if err != nil {
+		return "", "", err
+	}
+
+	if listener.Hostname == nil {
+		return "", "", fmt.Errorf("gateway listener %q has no hostname; set %q in the ConfigMap", sectionName, configKeyRouteHostname)
+	}
+	h := string(*listener.Hostname)
+	if strings.HasPrefix(h, "*.") {
+		return fmt.Sprintf("%s.%s%s", mcpServerName, mcpServerNamespace, h[1:]), "", nil
+	}
+	if err := guardDirectHostnameListener(listener, sectionName); err != nil {
+		return "", "", err
+	}
+	warning := fmt.Sprintf("listener %q uses a direct hostname; only one MCPServer can route through this listener", sectionName)
+	log.FromContext(ctx).Info(warning)
+	return h, warning, nil
+}
+
+// findGatewayListener fetches the Gateway and returns the listener matching
+// sectionName, or an error if the Gateway or listener is not found.
+func (r *Reconciler) findGatewayListener(ctx context.Context, gwName, gwNamespace, sectionName string) (*gatewayv1.Listener, error) {
+	gw := &gatewayv1.Gateway{}
+	if err := r.Get(ctx, client.ObjectKey{Name: gwName, Namespace: gwNamespace}, gw); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("gateway %s/%s not found", gwNamespace, gwName)
+		}
+		return nil, err
+	}
+	for i := range gw.Spec.Listeners {
+		if string(gw.Spec.Listeners[i].Name) == sectionName {
+			return &gw.Spec.Listeners[i], nil
+		}
+	}
+	return nil, fmt.Errorf("gateway %s/%s has no listener named %q", gwNamespace, gwName, sectionName)
+}
+
+// checkListenerHostnameGuard verifies that the selected listener can safely host
+// a per-server HTTPRoute. It is used on the explicit route-hostname path, which
+// does not go through resolveHostname, so the same safety guard would otherwise
+// be skipped. The guard only rejects a positively identified HTTPS/TLS listener
+// bound to a direct hostname; a missing Gateway or listener is not treated as a
+// new failure here (the explicit path never required the Gateway to be present),
+// leaving gateway-absence to be surfaced by the rest of the reconcile.
+func (r *Reconciler) checkListenerHostnameGuard(ctx context.Context, gwName, gwNamespace, sectionName string) error {
+	gw := &gatewayv1.Gateway{}
+	if err := r.Get(ctx, client.ObjectKey{Name: gwName, Namespace: gwNamespace}, gw); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	for i := range gw.Spec.Listeners {
+		if string(gw.Spec.Listeners[i].Name) == sectionName {
+			return guardDirectHostnameListener(&gw.Spec.Listeners[i], sectionName)
+		}
+	}
+	return nil
+}
+
+// guardDirectHostnameListener rejects listeners that cannot host per-server
+// routing with a direct (non-wildcard) hostname. Wildcard listeners and
+// listeners without a hostname are considered safe (the latter is paired with an
+// explicit route-hostname). An HTTPS/TLS listener bound to a direct hostname is
+// rejected because per-server routing requires a wildcard hostname.
+func guardDirectHostnameListener(listener *gatewayv1.Listener, sectionName string) error {
+	if listener.Hostname == nil || strings.HasPrefix(string(*listener.Hostname), "*.") {
+		return nil
+	}
+	if listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType {
+		return fmt.Errorf("gateway listener %q uses HTTPS/TLS with a direct hostname %q; HTTPS listeners require a wildcard hostname for per-server routing", sectionName, string(*listener.Hostname))
+	}
+	return nil
+}
+
+func (r *Reconciler) discoverWildcardListener(ctx context.Context, gwName, gwNamespace string) (string, error) {
 	gw := &gatewayv1.Gateway{}
 	if err := r.Get(ctx, client.ObjectKey{Name: gwName, Namespace: gwNamespace}, gw); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -523,21 +752,24 @@ func (r *Reconciler) resolveHostname(ctx context.Context, mcpServerName, mcpServ
 		return "", err
 	}
 
+	var wildcardListeners []string
 	for _, listener := range gw.Spec.Listeners {
-		if string(listener.Name) != sectionName {
-			continue
+		if listener.Hostname != nil && strings.HasPrefix(string(*listener.Hostname), "*.") {
+			wildcardListeners = append(wildcardListeners, string(listener.Name))
 		}
-		if listener.Hostname == nil {
-			return "", fmt.Errorf("gateway listener %q has no hostname; set %q in the ConfigMap", sectionName, configKeyRouteHostname)
-		}
-		h := string(*listener.Hostname)
-		if !strings.HasPrefix(h, "*.") {
-			return "", fmt.Errorf("gateway listener %q hostname %q is not a wildcard; set %q in the ConfigMap", sectionName, h, configKeyRouteHostname)
-		}
-		return fmt.Sprintf("%s.%s%s", mcpServerName, mcpServerNamespace, h[1:]), nil
 	}
 
-	return "", fmt.Errorf("gateway %s/%s has no listener named %q", gwNamespace, gwName, sectionName)
+	switch len(wildcardListeners) {
+	case 1:
+		return wildcardListeners[0], nil
+	case 0:
+		return "", fmt.Errorf("gateway %s/%s has no wildcard listeners; set %q in the ConfigMap to select a listener "+
+			"(also set %q when that listener has no hostname of its own)",
+			gwNamespace, gwName, configKeySectionName, configKeyRouteHostname)
+	default:
+		return "", fmt.Errorf("gateway %s/%s has multiple wildcard listeners (%s); set %q in the ConfigMap to select one",
+			gwNamespace, gwName, strings.Join(wildcardListeners, ", "), configKeySectionName)
+	}
 }
 
 func (r *Reconciler) resolvePublicEndpoint(ctx context.Context, ext *kuadrantapi.MCPGatewayExtension) (*publicEndpoint, error) {
@@ -605,7 +837,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&mcpv1alpha1.MCPGatewayBinding{}, builder.WithPredicates(providers.MatchesProvider(ProviderName))).
 		Owns(&gatewayv1.HTTPRoute{}).
 		Owns(&kuadrantapi.MCPServerRegistration{}).
-		Watches(
+		WatchesMetadata(
 			&corev1.ConfigMap{},
 			handler.EnqueueRequestsFromMapFunc(r.findBindingsForConfigMap),
 			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
@@ -663,7 +895,16 @@ func (r *Reconciler) findBindingsForGateway(ctx context.Context, obj client.Obje
 			continue
 		}
 		cm := &corev1.ConfigMap{}
-		if err := r.Get(ctx, client.ObjectKey{Name: b.Spec.ConfigRef, Namespace: b.Namespace}, cm); err != nil {
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Name: b.Spec.ConfigRef, Namespace: b.Namespace}, cm); err != nil {
+			// The read is uncached, so a transient failure must not silently drop
+			// this binding - that would be a missed reconcile until an unrelated
+			// event re-triggers it. Enqueue it anyway and let the idempotent
+			// Reconcile surface and requeue the error.
+			log.FromContext(ctx).V(1).Info("enqueuing binding despite uncached ConfigMap read error",
+				"binding", client.ObjectKeyFromObject(b), "configRef", b.Spec.ConfigRef, "error", err)
+			requests = append(requests, ctrl.Request{
+				NamespacedName: client.ObjectKeyFromObject(b),
+			})
 			continue
 		}
 		extName := cm.Data[configKeyExtensionName]
@@ -701,7 +942,16 @@ func (r *Reconciler) findBindingsForGatewayExtension(ctx context.Context, obj cl
 			continue
 		}
 		cm := &corev1.ConfigMap{}
-		if err := r.Get(ctx, client.ObjectKey{Name: b.Spec.ConfigRef, Namespace: b.Namespace}, cm); err != nil {
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Name: b.Spec.ConfigRef, Namespace: b.Namespace}, cm); err != nil {
+			// The read is uncached, so a transient failure must not silently drop
+			// this binding - that would be a missed reconcile until an unrelated
+			// event re-triggers it. Enqueue it anyway and let the idempotent
+			// Reconcile surface and requeue the error.
+			log.FromContext(ctx).V(1).Info("enqueuing binding despite uncached ConfigMap read error",
+				"binding", client.ObjectKeyFromObject(b), "configRef", b.Spec.ConfigRef, "error", err)
+			requests = append(requests, ctrl.Request{
+				NamespacedName: client.ObjectKeyFromObject(b),
+			})
 			continue
 		}
 		if cm.Data[configKeyExtensionName] == obj.GetName() &&
