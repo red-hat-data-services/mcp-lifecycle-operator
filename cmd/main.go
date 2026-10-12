@@ -51,8 +51,12 @@ import (
 
 	// Gateway integration providers register themselves via init().
 	// Add new providers here as blank imports.
-	_ "github.com/kubernetes-sigs/mcp-lifecycle-operator/internal/controller/providers/httproute"
-	_ "github.com/kubernetes-sigs/mcp-lifecycle-operator/internal/controller/providers/kuadrant"
+	// The httproute provider is imported by name (not blank) so its opt-in
+	// gateway-namespace allowlist can be configured from startup flags.
+	"github.com/kubernetes-sigs/mcp-lifecycle-operator/internal/controller/providers/httproute"
+	// The kuadrant provider is imported by name (not blank) so its opt-in
+	// extension-namespace allowlist can be configured from startup flags.
+	"github.com/kubernetes-sigs/mcp-lifecycle-operator/internal/controller/providers/kuadrant"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -91,6 +95,8 @@ func main() {
 	var requiredLabels string
 	var disallowPrivilegedSecurityContext bool
 	var networkPolicyDefaultPosture string
+	var httprouteAllowedGatewayNamespaces string
+	var kuadrantAllowedExtensionNamespaces string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -141,6 +147,18 @@ func main() {
 			"pods and each required gateway source; otherwise an enforcing CNI blocks the operator handshake and "+
 			"gateway traffic, so the server never becomes Verified and status.address/ServerReady are not "+
 			"published. Unconfigured egress is left unmanaged. Explicit Spec.Network values are always honored.")
+	flag.StringVar(&httprouteAllowedGatewayNamespaces, "httproute-allowed-gateway-namespaces", "",
+		"Comma-separated allowlist of namespaces the httproute gateway provider may attach an HTTPRoute to. "+
+			"The gateway namespace and name are supplied by a tenant-controlled ConfigMap and used verbatim as "+
+			"the HTTPRoute ParentRef, so restricting it prevents a tenant from attaching the route to another "+
+			"tenant's Gateway. Falls back to HTTPROUTE_ALLOWED_GATEWAY_NAMESPACES env var if not set. "+
+			"Empty means no restriction (any namespace named in a binding's ConfigMap is trusted).")
+	flag.StringVar(&kuadrantAllowedExtensionNamespaces, "kuadrant-allowed-extension-namespaces", "",
+		"Comma-separated allowlist of namespaces the kuadrant gateway provider may read MCPGatewayExtension "+
+			"routing config from. The extension namespace is supplied by a tenant-controlled ConfigMap, so "+
+			"restricting it prevents routing config from being read out of an attacker-planted namespace. "+
+			"Falls back to KUADRANT_ALLOWED_EXTENSION_NAMESPACES env var if not set. "+
+			"Empty means no restriction (any namespace named in a binding's ConfigMap is trusted).")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -155,6 +173,12 @@ func main() {
 		os.Exit(1)
 	}
 	setupLog.Info("NetworkPolicy default posture configured", "posture", defaultPosture)
+	// logr exposes no Warn level, so this open-posture security advisory is
+	// logged at Info with a "WARNING:" prefix so it stands out in the log,
+	// making the historical open default visible at startup instead of silent.
+	if advisory := openPostureStartupAdvisory(defaultPosture); advisory != "" {
+		setupLog.Info(advisory)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -259,6 +283,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Parse the admission policy up front (when the webhook is enabled) so the
+	// reconciler can report whether admission policies are actually enforced.
+	var admissionPolicy *webhookpolicy.AdmissionPolicy
+	if enableWebhook {
+		admissionPolicy = parseAdmissionFlags(imageAllowlist, requireImageDigest, maxStorageMounts, requiredLabels, disallowPrivilegedSecurityContext)
+	}
+
 	reconciler := &controller.MCPServerReconciler{
 		Client:                      mgr.GetClient(),
 		Scheme:                      mgr.GetScheme(),
@@ -278,6 +309,8 @@ func main() {
 			"control-plane":          "controller-manager",
 			"app.kubernetes.io/name": "mcp-lifecycle-operator",
 		},
+		WebhookEnabled:        enableWebhook,
+		AdmissionPolicyActive: enableWebhook && admissionPolicy.HasActiveRules(),
 	}
 	if defaultPosture == controller.PostureRestricted && reconciler.OperatorNamespace == "" {
 		setupLog.Info("Restricted NetworkPolicy posture is set but the operator namespace could not be " +
@@ -293,16 +326,55 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "MCPServer")
 		os.Exit(1)
 	}
+	httprouteFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "httproute-allowed-gateway-namespaces" {
+			httprouteFlagSet = true
+		}
+	})
+	if err := configureHTTPRouteProvider(httprouteAllowedGatewayNamespaces, httprouteFlagSet); err != nil {
+		setupLog.Error(err, "invalid --httproute-allowed-gateway-namespaces value")
+		os.Exit(1)
+	}
+	// Detect whether the allowlist flag was explicitly provided on the command
+	// line so an explicit --kuadrant-allowed-extension-namespaces="" can disable
+	// the control while the env var is still exported (flag wins over env).
+	kuadrantFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "kuadrant-allowed-extension-namespaces" {
+			kuadrantFlagSet = true
+		}
+	})
+	if err := configureKuadrantProvider(kuadrantAllowedExtensionNamespaces, kuadrantFlagSet); err != nil {
+		setupLog.Error(err, "invalid --kuadrant-allowed-extension-namespaces value")
+		os.Exit(1)
+	}
 	if err := providers.SetupAll(mgr); err != nil {
 		setupLog.Error(err, "unable to set up gateway providers")
 		os.Exit(1)
 	}
 	if enableWebhook {
-		admissionPolicy := parseAdmissionFlags(imageAllowlist, requireImageDigest, maxStorageMounts, requiredLabels, disallowPrivilegedSecurityContext)
 		if err := mcpv1alpha1.SetupWebhookWithManager(mgr, admissionPolicy); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "MCPServer")
 			os.Exit(1)
 		}
+		if !admissionPolicy.HasActiveRules() {
+			// The webhook is registered but no admission rules are configured, so it
+			// admits every spec unvalidated. Warn once at startup so this is not a
+			// silent gap; also surfaced per MCPServer via PolicyEnforced=False.
+			setupLog.Info("WARNING: validating admission webhook is enabled but no admission rules are " +
+				"configured; MCPServer specs are admitted without validation. Configure an image allowlist, " +
+				"digest pinning, storage-mount or securityContext policy to enforce admission.")
+		}
+	} else {
+		// The validating admission webhook is opt-in. With it disabled the image
+		// allowlist, digest pinning, storage-mount and securityContext admission
+		// policies are NOT enforced and MCPServer specs are admitted unvalidated.
+		// Warn once at startup so this is not a silent gap; the same state is also
+		// surfaced per MCPServer via the PolicyEnforced=False status condition.
+		setupLog.Info("WARNING: validating admission webhook is disabled (--enable-webhook=false); " +
+			"image allowlist, digest pinning, storage-mount and securityContext admission policies are " +
+			"NOT enforced. Enable the webhook in production to validate MCPServer specs.")
 	}
 	if err := (&mcpv1beta1.MCPServer{}).SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "MCPServer")
@@ -334,6 +406,87 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// openPostureStartupAdvisory returns the startup advisory to log when the
+// operator runs with the open (default) NetworkPolicy posture. Under that
+// posture an MCPServer that leaves spec.network.ingressFrom unset is reachable
+// from any pod in any namespace, which permits lateral movement on a
+// multi-tenant cluster. It returns the empty string for any non-open posture so
+// the caller logs nothing. logr has no Warn level, so the message carries a
+// "WARNING:" prefix and the caller logs it via Info.
+func openPostureStartupAdvisory(posture controller.NetworkPolicyDefaultPosture) string {
+	if posture != controller.PostureOpen {
+		return ""
+	}
+	return "WARNING: NetworkPolicy default posture is \"open\": managed MCP servers that leave " +
+		"spec.network.ingressFrom unset are reachable from any pod in any namespace, which permits " +
+		"lateral movement on a multi-tenant cluster. Set spec.network.ingressFrom per server, or start " +
+		"the operator with --network-policy-default-posture=restricted, to limit ingress. Each server " +
+		"reports its effective posture in the NetworkPolicyRestricted status condition."
+}
+
+// configureHTTPRouteProvider resolves the trusted gateway-namespace allowlist
+// from the flag (with env fallback) and applies it to the httproute provider
+// before the providers are set up. flagSet reports whether the flag was explicitly
+// provided so an explicit value (even "") wins over the env var. Invalid entries
+// are dropped with a warning so a typo (or an uppercase value that can never match
+// a lowercase namespace) is visible at startup. It fails closed: a non-empty
+// configuration that yields no valid entries returns an error (the caller treats
+// it as fatal) instead of silently reverting to the unrestricted default. When the
+// allowlist is empty the control is off and gateway-namespace is unrestricted; a
+// single startup advisory is logged so operators know the opt-in guardrail is
+// available.
+func configureHTTPRouteProvider(allowedGatewayNamespaces string, flagSet bool) error {
+	allowed, invalid, err := httproute.ResolveAllowedGatewayNamespaces(allowedGatewayNamespaces, flagSet)
+	if err != nil {
+		return err
+	}
+	for _, ns := range invalid {
+		setupLog.Info("Ignoring invalid entry in httproute gateway-namespace allowlist; "+
+			"entries must be valid RFC 1123 namespace names", "entry", ns)
+	}
+	httproute.SetAllowedGatewayNamespaces(allowed)
+	if len(allowed) > 0 {
+		setupLog.Info("HTTPRoute provider gateway-namespace allowlist configured",
+			"allowedGatewayNamespaces", allowed)
+	} else {
+		setupLog.Info("HTTPRoute provider gateway-namespace is unrestricted; set " +
+			"--httproute-allowed-gateway-namespaces to limit which namespaces an HTTPRoute may attach to")
+	}
+	return nil
+}
+
+// configureKuadrantProvider resolves the trusted extension-namespace allowlist
+// from the flag (with env fallback) and applies it to the kuadrant provider
+// before the providers are set up. flagSet reports whether the flag was explicitly
+// provided so an explicit value (even "") wins over the env var. Invalid entries
+// are dropped with a warning so a typo (or an uppercase value that can never match
+// a lowercase namespace) is visible at startup. It fails closed: a non-empty
+// configuration that yields no valid entries returns an error (the caller treats
+// it as fatal) instead of silently reverting to the unrestricted default. When the
+// allowlist is empty the control is off and extension-namespace is unrestricted; a
+// single startup advisory is logged so operators know the opt-in guardrail is
+// available.
+func configureKuadrantProvider(allowedExtensionNamespaces string, flagSet bool) error {
+	allowed, invalid, err := kuadrant.ResolveAllowedExtensionNamespaces(allowedExtensionNamespaces, flagSet)
+	if err != nil {
+		return err
+	}
+	for _, ns := range invalid {
+		setupLog.Info("Ignoring invalid entry in kuadrant extension-namespace allowlist; "+
+			"entries must be valid RFC 1123 namespace names", "entry", ns)
+	}
+	kuadrant.SetAllowedExtensionNamespaces(allowed)
+	if len(allowed) > 0 {
+		setupLog.Info("Kuadrant provider extension-namespace allowlist configured",
+			"allowedExtensionNamespaces", allowed)
+	} else {
+		setupLog.Info("Kuadrant provider extension-namespace is unrestricted; set " +
+			"--kuadrant-allowed-extension-namespaces to limit which namespaces MCPGatewayExtension " +
+			"routing config may be read from")
+	}
+	return nil
 }
 
 func parseAdmissionFlags(imageAllowlist string, requireImageDigest bool, maxStorageMounts int, requiredLabels string, disallowPrivilegedSecurityContext bool) *webhookpolicy.AdmissionPolicy {

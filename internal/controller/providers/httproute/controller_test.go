@@ -18,6 +18,8 @@ package httproute
 
 import (
 	"context"
+	"slices"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -43,6 +45,68 @@ const (
 	testGatewayName = "my-gateway"
 	testGatewayNS   = "gateway-ns"
 )
+
+func TestParseAllowedGatewayNamespaces(t *testing.T) {
+	cases := []struct {
+		name     string
+		flag     string
+		flagSet  bool
+		env      string
+		expected []string
+	}{
+		{"empty flag and env is disabled", "", false, "", nil},
+		{"flag parsed, trimmed, blanks dropped", " a , b ,, c ", true, "", []string{"a", "b", "c"}},
+		{"env fallback when flag not provided", "", false, "x, y", []string{"x", "y"}},
+		{"non-empty flag wins over env", "flagns", true, "envns", []string{"flagns"}},
+		{"explicitly empty flag overrides env (disables)", "", true, "envns", nil},
+		{"flag unset falls back to env even if flagValue blank", "", false, "envns", []string{"envns"}},
+		{"only blanks yields nil", " , , ", true, "", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envAllowedGatewayNamespaces, tc.env)
+			got := ParseAllowedGatewayNamespaces(tc.flag, tc.flagSet)
+			if !slices.Equal(got, tc.expected) {
+				t.Errorf("ParseAllowedGatewayNamespaces(%q, %v) with env %q = %v, want %v",
+					tc.flag, tc.flagSet, tc.env, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestResolveAllowedGatewayNamespaces(t *testing.T) {
+	cases := []struct {
+		name        string
+		flag        string
+		flagSet     bool
+		env         string
+		wantAllowed []string
+		wantInvalid []string
+		wantErr     bool
+	}{
+		{"empty is disabled, no error", "", false, "", nil, nil, false},
+		{"all valid entries pass through", "a,b", true, "", []string{"a", "b"}, nil, false},
+		{"mixed keeps valid and reports invalid", "good,Bad_NS", true, "", []string{"good"}, []string{"Bad_NS"}, false},
+		{"non-empty but all invalid fails closed", "Bad_NS,ALSO_BAD", true, "", nil, []string{"Bad_NS", "ALSO_BAD"}, true},
+		{"env fallback all invalid fails closed", "", false, "Bad_NS", nil, []string{"Bad_NS"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envAllowedGatewayNamespaces, tc.env)
+			allowed, invalid, err := ResolveAllowedGatewayNamespaces(tc.flag, tc.flagSet)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ResolveAllowedGatewayNamespaces(%q, %v) err = %v, wantErr %v",
+					tc.flag, tc.flagSet, err, tc.wantErr)
+			}
+			if !slices.Equal(allowed, tc.wantAllowed) {
+				t.Errorf("allowed = %v, want %v", allowed, tc.wantAllowed)
+			}
+			if !slices.Equal(invalid, tc.wantInvalid) {
+				t.Errorf("invalid = %v, want %v", invalid, tc.wantInvalid)
+			}
+		})
+	}
+}
 
 func newTestMCPServer(name string) *mcpv1beta1.MCPServer {
 	return &mcpv1beta1.MCPServer{
@@ -106,8 +170,9 @@ var _ = Describe("HTTPRoute Provider Controller", func() {
 
 	newReconciler := func() *Reconciler {
 		return &Reconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
 		}
 	}
 
@@ -726,6 +791,23 @@ var _ = Describe("HTTPRoute Provider Controller", func() {
 			Expect(requests[0].Name).To(Equal(bindingName))
 		})
 
+		It("should map from PartialObjectMetadata (what the metadata-only watch delivers)", func() {
+			createBinding(ProviderName)
+
+			r := newReconciler()
+			// WatchesMetadata delivers a *metav1.PartialObjectMetadata, not a full
+			// ConfigMap. The handler must map using only name/namespace.
+			partial := &metav1.PartialObjectMetadata{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      configMapName,
+					Namespace: testNamespace,
+				},
+			}
+			requests := r.findBindingsForConfigMap(ctx, partial)
+			Expect(requests).To(HaveLen(1))
+			Expect(requests[0].Name).To(Equal(bindingName))
+		})
+
 		It("should not return bindings for unrelated ConfigMaps", func() {
 			createBinding(ProviderName)
 
@@ -829,7 +911,11 @@ var _ = Describe("HTTPRoute Provider Controller", func() {
 			Expect(requests).To(BeEmpty())
 		})
 
-		It("should skip binding when referenced ConfigMap does not exist", func() {
+		It("should enqueue binding when referenced ConfigMap read fails (avoid dropped reconcile)", func() {
+			// The ConfigMap is intentionally not created, so the uncached read
+			// returns NotFound. The binding must still be enqueued so the
+			// idempotent Reconcile runs rather than the Gateway event being
+			// silently dropped for this binding.
 			createBinding(ProviderName)
 
 			r := newReconciler()
@@ -840,7 +926,8 @@ var _ = Describe("HTTPRoute Provider Controller", func() {
 				},
 			}
 			requests := r.findBindingsForGateway(ctx, gw)
-			Expect(requests).To(BeEmpty())
+			Expect(requests).To(HaveLen(1))
+			Expect(requests[0].Name).To(Equal(bindingName))
 		})
 	})
 
@@ -948,5 +1035,104 @@ var _ = Describe("HTTPRoute Provider Controller", func() {
 		Expect(registered).NotTo(BeNil())
 		Expect(registered.Status).To(Equal(metav1.ConditionFalse))
 		Expect(registered.Message).To(ContainSubstring(configKeyGatewayNamespace))
+	})
+
+	Describe("gateway-namespace trust gate", func() {
+		validConfigData := func() map[string]string {
+			return map[string]string{
+				configKeyGatewayName:      testGatewayName,
+				configKeyGatewayNamespace: testGatewayNS,
+			}
+		}
+
+		reconcileWithAllowlist := func(allowlist ...string) (reconcile.Result, error) {
+			r := &Reconciler{
+				Client:                   k8sClient,
+				APIReader:                k8sClient,
+				Scheme:                   k8sClient.Scheme(),
+				AllowedGatewayNamespaces: allowlist,
+			}
+			return r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: bindingName, Namespace: testNamespace},
+			})
+		}
+
+		expectRejected := func(substrings ...string) {
+			By("not creating an HTTPRoute for the rejected binding")
+			route := &gatewayv1.HTTPRoute{}
+			getErr := k8sClient.Get(ctx, client.ObjectKey{Name: bindingName, Namespace: testNamespace}, route)
+			Expect(apierrors.IsNotFound(getErr)).To(BeTrue())
+
+			binding := &mcpv1alpha1.MCPGatewayBinding{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: bindingName, Namespace: testNamespace}, binding)).To(Succeed())
+			registered := meta.FindStatusCondition(binding.Status.Conditions, mcpcontroller.ConditionTypeRegistered)
+			Expect(registered).NotTo(BeNil())
+			Expect(registered.Status).To(Equal(metav1.ConditionFalse))
+			Expect(registered.Reason).To(Equal(mcpcontroller.ReasonGatewayNotRegistered))
+			for _, s := range substrings {
+				Expect(registered.Message).To(ContainSubstring(s))
+			}
+		}
+
+		It("allows any valid gateway-namespace when the allowlist is unset", func() {
+			createMCPServer()
+			createConfigMap(validConfigData())
+			createBinding(ProviderName)
+
+			_, err := reconcileWithAllowlist()
+			Expect(err).NotTo(HaveOccurred())
+
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: bindingName, Namespace: testNamespace}, route)).To(Succeed())
+		})
+
+		It("allows an in-allowlist gateway-namespace", func() {
+			createMCPServer()
+			createConfigMap(validConfigData())
+			createBinding(ProviderName)
+
+			_, err := reconcileWithAllowlist("other-trusted", testGatewayNS)
+			Expect(err).NotTo(HaveOccurred())
+
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: bindingName, Namespace: testNamespace}, route)).To(Succeed())
+		})
+
+		It("rejects an out-of-allowlist gateway-namespace without building the route", func() {
+			createMCPServer()
+			createConfigMap(validConfigData())
+			createBinding(ProviderName)
+
+			_, err := reconcileWithAllowlist("trusted-ns")
+			Expect(err).NotTo(HaveOccurred())
+
+			expectRejected(testGatewayNS, "allowlist")
+		})
+
+		It("rejects a syntactically invalid gateway-namespace even when the allowlist is unset", func() {
+			createMCPServer()
+			data := validConfigData()
+			data[configKeyGatewayNamespace] = "Invalid_NS"
+			createConfigMap(data)
+			createBinding(ProviderName)
+
+			_, err := reconcileWithAllowlist()
+			Expect(err).NotTo(HaveOccurred())
+
+			expectRejected(configKeyGatewayNamespace, "Invalid_NS")
+		})
+
+		It("rejects a syntactically invalid gateway-name even when the allowlist is unset", func() {
+			createMCPServer()
+			data := validConfigData()
+			data[configKeyGatewayName] = "Invalid_Name"
+			createConfigMap(data)
+			createBinding(ProviderName)
+
+			_, err := reconcileWithAllowlist()
+			Expect(err).NotTo(HaveOccurred())
+
+			expectRejected(configKeyGatewayName, "Invalid_Name")
+		})
 	})
 })
