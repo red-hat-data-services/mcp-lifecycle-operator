@@ -11,11 +11,11 @@ ENV GOEXPERIMENT=strictfipsruntime
 ENV GOTOOLCHAIN=local
 RUN make -f Makefile-ocp.mk build-ocp GO_BUILD_ENV="GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH}"
 
-FROM --platform=$TARGETPLATFORM registry.access.redhat.com/ubi9/ubi-minimal@sha256:5ed244b62bbf4095080144d9d35eb8fcd3d39a9801f94aadd63b9d10978a01ae AS crypto-policy
+FROM --platform=$TARGETPLATFORM registry.access.redhat.com/ubi9/ubi-minimal@sha256:8fbe5ca09afa1990e9ff55fd8ee7cb073b823a7640c3c8381ece64f22401d2a2 AS crypto-policy
 RUN microdnf install -y crypto-policies-scripts && \
     update-crypto-policies --set DEFAULT:PQ --no-reload
 
-FROM --platform=$TARGETPLATFORM registry.access.redhat.com/ubi9/ubi-minimal@sha256:5ed244b62bbf4095080144d9d35eb8fcd3d39a9801f94aadd63b9d10978a01ae
+FROM --platform=$TARGETPLATFORM registry.access.redhat.com/ubi9/ubi-minimal@sha256:8fbe5ca09afa1990e9ff55fd8ee7cb073b823a7640c3c8381ece64f22401d2a2
 COPY --from=crypto-policy /etc/crypto-policies /etc/crypto-policies
 WORKDIR /
 COPY --from=builder /workspace/manager .
