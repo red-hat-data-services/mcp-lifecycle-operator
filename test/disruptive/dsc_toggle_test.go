@@ -83,11 +83,6 @@ func TestMCPLifecycleOperatorDSCToggle(t *testing.T) {
 		// workloadTimeout bounds teardown observations (pods/module CR gone), which
 		// do not involve an image pull.
 		workloadTimeout = 3 * time.Minute
-		// webhookServiceName is the operator's conversion/validation webhook
-		// Service (config namePrefix "mcp-lifecycle-operator-" + "webhook-service").
-		// Creating a v1beta1 MCPServer goes through this service's conversion
-		// webhook, so it must have ready endpoints before the functional check.
-		webhookServiceName = "mcp-lifecycle-operator-webhook-service"
 	)
 
 	feature := features.New("MCPLifecycleOperator DSC managementState toggle").
@@ -123,19 +118,18 @@ func TestMCPLifecycleOperatorDSCToggle(t *testing.T) {
 				waitModuleCRGone(ctx, t, c, workloadTimeout)
 				waitOperatorPodsGone(ctx, t, cfg, opNamespace, workloadTimeout)
 
-				// Recovery step: toggle back to Managed and expect the operator to
-				// return.
+				// Recovery step: toggle back to Managed and wait on the
+				// customer-facing readiness signal before creating the MCPServer.
+				// MCPLifecycleOperatorReady is the condition customers check; the
+				// ODH module reports it True only after the operand deployment is
+				// Available, which in turn means the controller-manager pod is Ready
+				// and the conversion-webhook Service has endpoints. Gating on this
+				// condition (rather than on a merely-Running pod and webhook endpoint
+				// lookups) fixes the earlier "no endpoints available for service"
+				// race while testing exactly what customers rely on.
 				setMCPLOManagementState(ctx, t, c, dscName, f.StateManaged)
 				waitDSCComponentStatus(ctx, t, c, dscName, f.StateManaged, statusTimeout)
-				waitOperatorPodRunning(ctx, t, cfg, opNamespace, operatorReadyTimeout)
-
-				// A Running pod is not yet a serving webhook: the conversion
-				// webhook Service only gets endpoints once the pod passes its
-				// readiness probe and the endpoints propagate. Creating the
-				// v1beta1 MCPServer below is routed through that conversion
-				// webhook, so without this wait the create races the endpoint
-				// propagation and fails with "no endpoints available for service".
-				f.WaitForEndpointsReady(ctx, t, cfg, opNamespace, webhookServiceName)
+				waitDSCMCPLOReady(ctx, t, c, dscName, operatorReadyTimeout)
 
 				// Functional proof: a fresh MCPServer reconciles end-to-end
 				// (Available + Verified), proving the re-enabled operator is not
