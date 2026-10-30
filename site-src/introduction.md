@@ -138,10 +138,15 @@ status:
     - type: Accepted
       status: "True"
       reason: Valid
-    - type: Ready
+    - type: Available
       status: "True"
       reason: Available
+    - type: Verified
+      status: "True"
+      reason: Verified
 ```
+
+`Accepted` indicates valid configuration, `Available` indicates a ready workload, and `Verified` indicates that the MCP endpoint passed verification. Inspect each condition's reason and message for details.
 
 The `address.url` field provides the cluster-internal URL that other workloads can use to connect to the MCP server.
 
@@ -177,7 +182,7 @@ The operator watches for `MCPServer` resources and automatically:
 
 - **Get Started**: Follow the [Quickstart Guide](guides/quickstart.md)
 - **Examples**: Check out the [examples directory](https://github.com/kubernetes-sigs/mcp-lifecycle-operator/tree/main/examples)
-- **API Reference**: See the [API documentation](reference/) for all available fields
+- **API Reference**: See the [API documentation](reference/index.md) for all available fields
 - **Complete Example**: See the [complete MCPServer sample](https://github.com/kubernetes-sigs/mcp-lifecycle-operator/blob/main/config/samples/mcp_v1beta1_mcpserver_complete.yaml) for a YAML with every field
 - **Contributing**: Read the [Contributing Guide](contributing/index.md) to get involved
 - **Community**: Join [SIG Apps](https://github.com/kubernetes/community/blob/main/sig-apps/README.md) meetings and discussions
