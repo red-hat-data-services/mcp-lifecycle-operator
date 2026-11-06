@@ -26,7 +26,7 @@ import (
 const (
 	DefaultMCPServerImage   = "quay.io/containers/kubernetes_mcp_server@sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423" // :v0.0.66
 	AlternateMCPServerImage = "quay.io/containers/kubernetes_mcp_server@sha256:5df586e2c7ced2a3125f6e78923388d80b69de0a2ad1470325b05318f12725bd" // :v0.0.65
-	BusyboxImage            = "docker.io/library/busybox@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"                // :1.38
+	BusyboxImage            = "public.ecr.aws/docker/library/busybox@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"    // :1.38
 )
 
 // MCPServerOption configures an MCPServer for testing.
@@ -130,6 +130,27 @@ func WithGateway(provider, configRef string) MCPServerOption {
 func WithNetwork(network *mcpv1beta1.NetworkConfig) MCPServerOption {
 	return func(s *mcpv1beta1.MCPServer) {
 		s.Spec.Network = network
+	}
+}
+
+// WithWorkloadRef configures the MCPServer to reference an external (BYO)
+// workload instead of an operator-managed Deployment. It clears the source and
+// container arguments set by NewMCPServer, since workloadRef is mutually
+// exclusive with source and operator-managed workload config (see the
+// MCPServerSpec CEL validation rules).
+func WithWorkloadRef(ref *mcpv1beta1.WorkloadReference) MCPServerOption {
+	return func(s *mcpv1beta1.MCPServer) {
+		s.Spec.WorkloadRef = ref
+		s.Spec.Source = mcpv1beta1.Source{}
+		s.Spec.Config.Arguments = nil
+	}
+}
+
+// WithServiceRef configures the MCPServer to reference an external (BYO)
+// Service instead of an operator-managed Service.
+func WithServiceRef(ref *mcpv1beta1.ServiceReference) MCPServerOption {
+	return func(s *mcpv1beta1.MCPServer) {
+		s.Spec.ServiceRef = ref
 	}
 }
 
