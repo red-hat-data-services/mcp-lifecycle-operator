@@ -2,7 +2,7 @@ module github.com/kubernetes-sigs/mcp-lifecycle-operator
 
 go 1.26.0
 
-toolchain go1.26.5
+toolchain go1.26.11
 
 require (
 	github.com/modelcontextprotocol/go-sdk v1.6.1
