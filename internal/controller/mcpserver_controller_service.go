@@ -19,6 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -33,13 +36,15 @@ import (
 )
 
 // reconcileService creates or updates the Service for the MCPServer.
+// selector is the label selector the Service uses to target pods.
 func (r *MCPServerReconciler) reconcileService(
 	ctx context.Context,
 	mcpServer *mcpv1beta1.MCPServer,
+	selector map[string]string,
 ) error {
 	logger := log.FromContext(ctx)
 
-	service := r.createService(mcpServer)
+	service := r.createService(mcpServer, selector)
 	if err := controllerutil.SetControllerReference(mcpServer, service, r.Scheme); err != nil {
 		logger.Error(err, "Failed to set controller reference for Service")
 		return err
@@ -114,9 +119,14 @@ func (r *MCPServerReconciler) reconcileService(
 	return nil
 }
 
-// createService creates a Service for the MCPServer
-func (r *MCPServerReconciler) createService(mcpServer *mcpv1beta1.MCPServer) *corev1.Service {
+// createService creates a Service for the MCPServer using the given selector.
+func (r *MCPServerReconciler) createService(mcpServer *mcpv1beta1.MCPServer, selector map[string]string) *corev1.Service {
 	labels := managedWorkloadLabels(mcpServer.Name)
+	targetPort := intstr.FromString(mcpPortName)
+	if mcpServer.Spec.WorkloadRef != nil {
+		// External containers need not declare an operator-specific named port.
+		targetPort = intstr.FromInt32(mcpServer.Spec.Config.Port)
+	}
 
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -126,12 +136,12 @@ func (r *MCPServerReconciler) createService(mcpServer *mcpv1beta1.MCPServer) *co
 		},
 		Spec: corev1.ServiceSpec{
 			Type:     corev1.ServiceTypeClusterIP,
-			Selector: managedWorkloadSelector(mcpServer.Name),
+			Selector: selector,
 			Ports: []corev1.ServicePort{
 				{
-					Name:       "mcp",
+					Name:       mcpPortName,
 					Port:       mcpServer.Spec.Config.Port,
-					TargetPort: intstr.FromString("mcp"),
+					TargetPort: targetPort,
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},
@@ -145,4 +155,188 @@ func (r *MCPServerReconciler) createService(mcpServer *mcpv1beta1.MCPServer) *co
 	}
 
 	return service
+}
+
+// ServiceEndpoint identifies the Service and exposed port used for MCP traffic.
+// Resolution preserves Name on error so callers can record the dependency.
+type ServiceEndpoint struct {
+	Name string
+	Port int32
+}
+
+// resolveServicePort determines the port to use for the MCP endpoint when
+// serviceRef is set. If configPort > 0, it is used directly. Otherwise the
+// referenced Service is fetched and a port named "mcp" is preferred, falling
+// back to the first port.
+func resolveServicePort(ctx context.Context, r client.Reader, serviceName, namespace string, configPort int32) (int32, error) {
+	if configPort > 0 {
+		return configPort, nil
+	}
+
+	svc := &corev1.Service{}
+	if err := r.Get(ctx, client.ObjectKey{Name: serviceName, Namespace: namespace}, svc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return 0, fmt.Errorf("referenced Service %s not found", serviceName)
+		}
+		return 0, err
+	}
+
+	if len(svc.Spec.Ports) == 0 {
+		return 0, fmt.Errorf("referenced Service %s has no ports", serviceName)
+	}
+
+	for _, p := range svc.Spec.Ports {
+		if p.Name == mcpPortName {
+			return p.Port, nil
+		}
+	}
+
+	return svc.Spec.Ports[0].Port, nil
+}
+
+// serviceNameFor returns the Service identity even when endpoint resolution or
+// configuration validation fails.
+func serviceNameFor(server *mcpv1beta1.MCPServer) string {
+	if server.Spec.ServiceRef != nil {
+		return server.Spec.ServiceRef.Name
+	}
+	return server.Name
+}
+
+// ResolveServiceEndpoint returns the Service name and port used for MCP traffic.
+// Gateway providers use the same resolution as the MCP handshake, including
+// inferred ports on externally managed Services.
+func ResolveServiceEndpoint(ctx context.Context, reader client.Reader, server *mcpv1beta1.MCPServer) (ServiceEndpoint, error) {
+	if server.Spec.ServiceRef == nil {
+		return ServiceEndpoint{Name: serviceNameFor(server), Port: server.Spec.Config.Port}, nil
+	}
+	name := serviceNameFor(server)
+	configPort := server.Spec.Config.Port
+	if server.Spec.WorkloadRef == nil {
+		// For managed workloads config.port describes the container, which may
+		// differ from the referenced Service's exposed port.
+		configPort = 0
+	}
+	port, err := resolveServicePort(ctx, reader, name, server.Namespace, configPort)
+	return ServiceEndpoint{Name: name, Port: port}, err
+}
+
+// reconcileServiceOrBYO either reconciles the operator-managed Service or
+// resolves the BYO Service port. Service identity comes from serviceNameFor.
+func (r *MCPServerReconciler) reconcileServiceOrBYO(
+	ctx context.Context,
+	mcpServer *mcpv1beta1.MCPServer,
+	selector map[string]string,
+) (ServiceEndpoint, error) {
+	if mcpServer.Spec.ServiceRef != nil {
+		endpoint, err := ResolveServiceEndpoint(ctx, r.APIReader, mcpServer)
+		if err != nil {
+			return endpoint, err
+		}
+		// A serviceRef may be added to an MCPServer that already has an
+		// operator-managed Service. Endpoint resolution above has switched to the
+		// external Service, so the previously managed Service must be cleaned up or
+		// it lingers unreconciled and goes stale. Cleanup is guarded so the
+		// operator never deletes a Service it does not own or still relies on.
+		if err := r.cleanupManagedServiceForBYO(ctx, mcpServer); err != nil {
+			return endpoint, err
+		}
+		return endpoint, nil
+	}
+
+	serviceStart := time.Now()
+	if err := r.reconcileService(ctx, mcpServer, selector); err != nil {
+		reconcileDuration.With(prometheus.Labels{keyPhase: ReconcilePhaseService}).Observe(time.Since(serviceStart).Seconds())
+		return ServiceEndpoint{}, err
+	}
+	reconcileDuration.With(prometheus.Labels{keyPhase: ReconcilePhaseService}).Observe(time.Since(serviceStart).Seconds())
+	return ServiceEndpoint{Name: serviceNameFor(mcpServer), Port: mcpServer.Spec.Config.Port}, nil
+}
+
+// cleanupManagedServiceForBYO deletes a previously operator-managed Service after
+// an external serviceRef is added to the MCPServer. serviceRef is not immutable, so
+// a user may point an MCPServer at an external Service while an operator-managed
+// Service (named after the MCPServer) still exists. Once endpoint resolution
+// switches to the external Service the managed Service is no longer reconciled and
+// goes stale (a later container port change leaves it pointing at an obsolete
+// port). This performs a safe cleanup guarded so the operator never removes a
+// Service it does not own or still relies on:
+//
+//  1. The external serviceRef Service is resolved and must exist before anything is
+//     deleted. A missing reference fails safe and leaves the managed Service in
+//     place, surfaced through the normal Service-failure status/event path.
+//  2. The managed Service is deleted only when its controller owner reference UID
+//     matches this MCPServer's UID. Services owned by anything else, or with no
+//     controller owner (user-owned), are preserved.
+//  3. A self-referencing serviceRef (serviceRef.name == MCPServer name) points at
+//     the very Service the operator would manage, so it is preserved.
+//  4. Deletion uses UID + resourceVersion preconditions so a Service replaced
+//     between the read and the delete is not removed.
+//
+// The function is idempotent: when no managed Service exists there is nothing to do.
+func (r *MCPServerReconciler) cleanupManagedServiceForBYO(
+	ctx context.Context,
+	mcpServer *mcpv1beta1.MCPServer,
+) error {
+	logger := log.FromContext(ctx)
+
+	// Guard 3: a self-referencing serviceRef names the operator-managed Service
+	// itself; the external and managed Service are the same object, never delete it.
+	if mcpServer.Spec.ServiceRef != nil && mcpServer.Spec.ServiceRef.Name == mcpServer.Name {
+		return nil
+	}
+
+	// The operator-managed Service is always named after the MCPServer. Look it up
+	// first so the steady state (serviceRef already set, nothing to clean up) and a
+	// not-yet-created external Service never hit the external resolution below.
+	managedSvc := &corev1.Service{}
+	if err := r.Get(ctx, client.ObjectKey{Name: mcpServer.Name, Namespace: mcpServer.Namespace}, managedSvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Nothing to clean up: the managed Service never existed or is already gone.
+			return nil
+		}
+		return err
+	}
+
+	// Guard 2: only delete a Service this exact MCPServer controls. Compare the
+	// controller owner reference UID; preserve Services owned by anything else or
+	// with no controller owner (user-owned).
+	owner := metav1.GetControllerOf(managedSvc)
+	if owner == nil || owner.UID != mcpServer.UID {
+		logger.Info("Preserving Service not owned by this MCPServer after serviceRef was added",
+			keyName, managedSvc.Name, keyNamespace, managedSvc.Namespace)
+		return nil
+	}
+
+	// Guard 1: resolve and validate the external Service before deleting the owned
+	// managed Service. A missing reference fails safe and leaves the managed Service
+	// in place, surfaced through the normal Service-failure status/event path.
+	externalName := serviceNameFor(mcpServer)
+	externalSvc := &corev1.Service{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Name: externalName, Namespace: mcpServer.Namespace}, externalSvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("referenced Service %s not found", externalName)
+		}
+		return err
+	}
+
+	// Guard 4: UID + resourceVersion deletion preconditions so a Service that was
+	// replaced between the read above and the delete is not removed.
+	preconditions := client.Preconditions{
+		UID:             &managedSvc.UID,
+		ResourceVersion: &managedSvc.ResourceVersion,
+	}
+	if err := r.Delete(ctx, managedSvc, preconditions); err != nil {
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			// Already deleted or replaced concurrently; nothing further to do.
+			return nil
+		}
+		logger.Error(err, "Failed to delete stale managed Service after serviceRef was added",
+			keyName, managedSvc.Name)
+		return err
+	}
+
+	logger.Info("Deleted stale operator-managed Service after serviceRef was added",
+		keyName, managedSvc.Name, keyNamespace, managedSvc.Namespace)
+	return nil
 }

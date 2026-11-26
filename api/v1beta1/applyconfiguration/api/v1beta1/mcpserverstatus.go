@@ -33,20 +33,37 @@ type MCPServerStatusApplyConfiguration struct {
 	ObservedGeneration *int64 `json:"observedGeneration,omitempty"`
 	// DeploymentName is the name of the Deployment created for this MCPServer.
 	DeploymentName *string `json:"deploymentName,omitempty"`
-	// ServiceName is the name of the Service created for this MCPServer.
+	// ServiceName is the name of the Service backing this MCPServer.
+	// For operator-managed mode this is the created Service; for BYO this
+	// is the serviceRef name, or the MCPServer name when serviceRef is unset.
 	ServiceName *string `json:"serviceName,omitempty"`
+	// WorkloadName identifies the workload backing this MCPServer.
+	// For BYO: "{Kind}/{Name}" (e.g. "DaemonSet/my-ds").
+	// Empty for operator-managed workloads (use DeploymentName instead).
+	WorkloadName *string `json:"workloadName,omitempty"`
+	// WorkloadSummary is a human-readable summary for the print column.
+	// For BYO: "BYO:{Kind}/{Name}". For operator-managed: the container image ref.
+	WorkloadSummary *string `json:"workloadSummary,omitempty"`
 	// GatewayBinding contains the status of the MCPGatewayBinding created for
 	// this MCPServer, when spec.gateway is configured.
 	GatewayBinding *GatewayBindingStatusApplyConfiguration `json:"gatewayBinding,omitempty"`
 	// Address contains the address of the MCP server service.
 	Address *MCPServerAddressApplyConfiguration `json:"address,omitempty"`
+	// VerifiedEndpointURL is the internal Service URL for which Verified=True
+	// was established. Unlike Address, it is not replaced by a gateway URL.
+	// A changed or missing value requires endpoint verification again.
+	VerifiedEndpointURL *string `json:"verifiedEndpointURL,omitempty"`
 	// ServerInfo contains identity and capability information reported by the
 	// MCP server during the protocol handshake (initialize or server/discover).
 	// This field is populated only after a successful handshake.
 	ServerInfo *MCPServerInfoApplyConfiguration `json:"serverInfo,omitempty"`
-	// Replicas is the total number of desired pods targeted by the owned Deployment.
+	// Replicas is the total number of desired instances for this MCPServer.
+	// For operator-managed mode this reflects the owned Deployment; for BYO
+	// this reflects the referenced workload (Deployment, DaemonSet, or StatefulSet).
 	Replicas *int32 `json:"replicas,omitempty"`
-	// ReadyReplicas is the number of pods targeted by the owned Deployment with a Ready condition.
+	// ReadyReplicas is the number of healthy instances for this MCPServer.
+	// For operator-managed mode this reflects the owned Deployment; for BYO
+	// this reflects the referenced workload.
 	ReadyReplicas *int32 `json:"readyReplicas,omitempty"`
 	// Conditions represent the latest available observations of the MCPServer's state.
 	//
@@ -99,6 +116,22 @@ func (b *MCPServerStatusApplyConfiguration) WithServiceName(value string) *MCPSe
 	return b
 }
 
+// WithWorkloadName sets the WorkloadName field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the WorkloadName field is set to the value of the last call.
+func (b *MCPServerStatusApplyConfiguration) WithWorkloadName(value string) *MCPServerStatusApplyConfiguration {
+	b.WorkloadName = &value
+	return b
+}
+
+// WithWorkloadSummary sets the WorkloadSummary field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the WorkloadSummary field is set to the value of the last call.
+func (b *MCPServerStatusApplyConfiguration) WithWorkloadSummary(value string) *MCPServerStatusApplyConfiguration {
+	b.WorkloadSummary = &value
+	return b
+}
+
 // WithGatewayBinding sets the GatewayBinding field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the GatewayBinding field is set to the value of the last call.
@@ -112,6 +145,14 @@ func (b *MCPServerStatusApplyConfiguration) WithGatewayBinding(value *GatewayBin
 // If called multiple times, the Address field is set to the value of the last call.
 func (b *MCPServerStatusApplyConfiguration) WithAddress(value *MCPServerAddressApplyConfiguration) *MCPServerStatusApplyConfiguration {
 	b.Address = value
+	return b
+}
+
+// WithVerifiedEndpointURL sets the VerifiedEndpointURL field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the VerifiedEndpointURL field is set to the value of the last call.
+func (b *MCPServerStatusApplyConfiguration) WithVerifiedEndpointURL(value string) *MCPServerStatusApplyConfiguration {
+	b.VerifiedEndpointURL = &value
 	return b
 }
 
