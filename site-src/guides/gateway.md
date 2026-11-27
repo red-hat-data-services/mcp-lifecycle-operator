@@ -28,7 +28,7 @@ This design is extensible - any provider can implement its own integration contr
 Add `spec.gateway` to your MCPServer to enable gateway integration:
 
 ```yaml
-apiVersion: mcp.x-k8s.io/v1beta1
+apiVersion: mcp.x-k8s.io/v1
 kind: MCPServer
 metadata:
   name: my-mcp-server
@@ -50,6 +50,8 @@ spec:
 |--------------------|----------|------------------------------------------------------------------|
 | `gateway.provider` | Yes      | Provider name that identifies the integration controller          |
 | `gateway.configRef` | No       | Name of a ConfigMap with provider-specific configuration          |
+
+Gateway integration also works with [existing workloads and Services](byo.md). When `serviceRef` is set, both built-in providers route to that Service using the same resolved Service port as endpoint verification. Keep `config.port` as the container port for managed workloads, even if the referenced Service exposes a different port. The published address can be a gateway URL while verification still targets the internal Service URL.
 
 ## MCPGatewayBinding
 
@@ -246,7 +248,7 @@ Both resources are owned by the MCPGatewayBinding, so they are automatically del
 ### MCPServer Configuration
 
 ```yaml
-apiVersion: mcp.x-k8s.io/v1beta1
+apiVersion: mcp.x-k8s.io/v1
 kind: MCPServer
 metadata:
   name: my-mcp-server

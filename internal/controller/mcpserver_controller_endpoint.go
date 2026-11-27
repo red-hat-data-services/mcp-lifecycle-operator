@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,14 +27,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	mcpv1beta1 "github.com/kubernetes-sigs/mcp-lifecycle-operator/api/v1beta1"
-	acv1beta1 "github.com/kubernetes-sigs/mcp-lifecycle-operator/api/v1beta1/applyconfiguration/api/v1beta1"
+	mcpv1 "github.com/kubernetes-sigs/mcp-lifecycle-operator/api/v1"
+	acv1 "github.com/kubernetes-sigs/mcp-lifecycle-operator/api/v1/applyconfiguration/api/v1"
 )
 
 // workloadStatusConfiguration builds identity and replica status for either
 // workload mode. Both successful and failed reconciliations use this base.
-func workloadStatusConfiguration(server *mcpv1beta1.MCPServer, replicas, readyReplicas int32) *acv1beta1.MCPServerStatusApplyConfiguration {
-	status := acv1beta1.MCPServerStatus().
+func workloadStatusConfiguration(server *mcpv1.MCPServer, replicas, readyReplicas int32) *acv1.MCPServerStatusApplyConfiguration {
+	status := acv1.MCPServerStatus().
 		WithObservedGeneration(server.Generation).
 		WithServiceName(serviceNameFor(server)).
 		WithReplicas(replicas).
@@ -49,13 +50,22 @@ func workloadStatusConfiguration(server *mcpv1beta1.MCPServer, replicas, readyRe
 	return status
 }
 
+// mcpServiceURL builds the cluster-local MCP endpoint URL used for handshake verification and status publication.
+func mcpServiceURL(mcpServer *mcpv1.MCPServer, endpoint ServiceEndpoint, clusterDomain, path string) string {
+	clusterDomain = strings.TrimSpace(clusterDomain)
+	if clusterDomain == "" {
+		clusterDomain = DefaultClusterDomain
+	}
+	return fmt.Sprintf("%s://%s.%s.svc.%s:%d%s", urlScheme(mcpServer), endpoint.Name, mcpServer.Namespace, clusterDomain, endpoint.Port, path)
+}
+
 // reconcileEndpoint completes networking, verification, gateway registration and
 // status publication after the managed or referenced workload has been observed.
 func (r *MCPServerReconciler) reconcileEndpoint(
 	ctx context.Context,
-	mcpServer *mcpv1beta1.MCPServer,
+	mcpServer *mcpv1.MCPServer,
 	acceptedCondition, availableCondition metav1.Condition,
-	status *acv1beta1.MCPServerStatusApplyConfiguration,
+	status *acv1.MCPServerStatusApplyConfiguration,
 	endpoint ServiceEndpoint,
 	networkPolicyCondition *metav1.Condition,
 ) (ctrl.Result, error) {
@@ -81,8 +91,7 @@ func (r *MCPServerReconciler) reconcileEndpoint(
 		path = DefaultMCPPath
 	}
 
-	mcpURL := fmt.Sprintf("%s://%s.%s.svc.cluster.local:%d%s",
-		urlScheme(mcpServer), endpoint.Name, mcpServer.Namespace, endpoint.Port, path)
+	mcpURL := mcpServiceURL(mcpServer, endpoint, r.ClusterDomain, path)
 
 	// Compute current TLS CA bundle hash so the handshake is re-verified
 	// when the CA bundle Secret content changes (which does not bump generation).
@@ -93,12 +102,17 @@ func (r *MCPServerReconciler) reconcileEndpoint(
 
 	// If the workload is available, verify the MCP endpoint.
 	verifiedCondition, serverInfo := r.reconcileHandshake(ctx, mcpServer, mcpURL, availableCondition, tlsCABundleHash)
+	if verifiedCondition.Status == metav1.ConditionTrue {
+		// Persist the verified internal URL together with its condition, before
+		// gateway status can replace the published address with an external URL.
+		status.WithVerifiedEndpointURL(mcpURL)
+	}
 
 	// Record Verified condition metric
 	recordCondition(mcpServer.Name, mcpServer.Namespace,
 		verifiedCondition.Type, string(verifiedCondition.Status), verifiedCondition.Reason)
 
-	handshakeRetryCount := r.reconcileHandshakeEventsAndRetryCount(mcpServer, &verifiedCondition)
+	handshakeRetryCount := r.reconcileHandshakeEventsAndRetryCount(mcpServer, mcpURL, &verifiedCondition)
 
 	// Resolve gateway status: condition + binding status + address override.
 	// Must run before the ready-event check so availableCondition reflects

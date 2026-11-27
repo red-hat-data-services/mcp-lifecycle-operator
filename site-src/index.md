@@ -2,8 +2,9 @@
 
 A Kubernetes operator that provides a declarative API to deploy, manage, and safely roll out [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers on Kubernetes, handling their full lifecycle with production-grade automation and ecosystem integrations.
 
-!!! warning "Beta"
-    This project is currently in **beta** (`v1beta1`). APIs and behavior may change in future releases.
+`MCPServer` has a GA `mcp.x-k8s.io/v1` API. Existing `v1beta1` and `v1alpha1` clients remain supported while those versions are served. `MCPGatewayBinding` remains `v1alpha1`.
+
+For older clients, see the [v1beta1 MCPServer reference](reference/v1beta1.md) and [v1alpha1 MCPServer reference](reference/v1alpha1.md). See the [MCPGatewayBinding reference](reference/mcpgatewaybinding.md) for the alpha gateway binding. Before retiring an older served version, follow the [storage migration guide](operating/storage-version-migration.md).
 
 ## Core Capabilities
 
@@ -20,7 +21,7 @@ A Kubernetes operator that provides a declarative API to deploy, manage, and saf
 Deploy an MCP server with a simple YAML manifest:
 
 ```yaml
-apiVersion: mcp.x-k8s.io/v1beta1
+apiVersion: mcp.x-k8s.io/v1
 kind: MCPServer
 metadata:
   name: my-mcp-server
@@ -45,6 +46,8 @@ kubectl apply -f https://github.com/kubernetes-sigs/mcp-lifecycle-operator/relea
 ## Get Started
 
 Learn more about the operator in the [Introduction](introduction.md), or jump straight to the [Getting Started Guide](guides/quickstart.md) to deploy your first MCP server. You can also explore the [examples](https://github.com/kubernetes-sigs/mcp-lifecycle-operator/tree/main/examples).
+
+The quickstart uses the default managed mode, where the operator creates the workload and Service. To connect resources managed elsewhere, see [Use an Existing Workload or Service](guides/byo.md).
 
 ## Community
 

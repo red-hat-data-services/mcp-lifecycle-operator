@@ -54,7 +54,7 @@ In a new terminal, create a basic `MCPServer` resource using the [kubernetes-mcp
 
 ```bash
 kubectl apply -f - <<EOF
-apiVersion: mcp.x-k8s.io/v1beta1
+apiVersion: mcp.x-k8s.io/v1
 kind: MCPServer
 metadata:
   name: kubernetes-mcp-server
@@ -102,7 +102,7 @@ kubectl get pods -l mcp-server=kubernetes-mcp-server
 Expected output from `kubectl get mcpservers`:
 
 ```
-NAME                    ACCEPTED   AVAILABLE   VERIFIED   IMAGE                                             PORT   ADDRESS                                                         AGE
+NAME                    ACCEPTED   AVAILABLE   VERIFIED   WORKLOAD                                          PORT   ADDRESS                                                         AGE
 kubernetes-mcp-server   True       True        True       quay.io/containers/kubernetes_mcp_server:latest    8080   http://kubernetes-mcp-server.default.svc.cluster.local:8080/mcp   1m
 ```
 
@@ -198,7 +198,7 @@ data:
     toolsets = ["core", "config"]
 ---
 # MCPServer resource with ServiceAccount for RBAC
-apiVersion: mcp.x-k8s.io/v1beta1
+apiVersion: mcp.x-k8s.io/v1
 kind: MCPServer
 metadata:
   name: kubernetes-mcp-server-rbac
@@ -263,6 +263,7 @@ make uninstall
 
 ## Next Steps
 
+- To connect resources managed outside the operator, see [Use an Existing Workload or Service](byo.md).
 - Explore more examples:
   - [kubernetes-mcp-server examples](https://github.com/kubernetes-sigs/mcp-lifecycle-operator/tree/main/examples/kubernetes-mcp-server) - Basic, ConfigMap, and RBAC examples
   - [All examples](https://github.com/kubernetes-sigs/mcp-lifecycle-operator/tree/main/examples)
